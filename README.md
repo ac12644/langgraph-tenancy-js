@@ -1,12 +1,14 @@
 # langgraph-tenancy
 
 [![CI](https://github.com/ac12644/langgraph-tenancy-js/actions/workflows/ci.yml/badge.svg)](https://github.com/ac12644/langgraph-tenancy-js/actions/workflows/ci.yml)
-[![npm](https://img.shields.io/npm/v/langgraph-tenancy.svg)](https://www.npmjs.com/package/langgraph-tenancy)
+[![NPM Version](https://img.shields.io/npm/v/langgraph-tenancy)](https://www.npmjs.com/package/langgraph-tenancy)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 **Tenant isolation for LangGraph.js persistence — as a drop-in wrapper.**
 
-> Python version: [langgraph-tenancy on PyPI](https://pypi.org/project/langgraph-tenancy/)
+> Using Python? Same package, same guarantees:
+> [ac12644/langgraph-tenancy](https://github.com/ac12644/langgraph-tenancy) ·
+> [PyPI](https://pypi.org/project/langgraph-tenancy/)
 
 LangGraph's own [threat model](https://github.com/langchain-ai/langgraph/blob/main/.github/THREAT_MODEL.md) says it plainly:
 
