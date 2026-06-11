@@ -1,35 +1,72 @@
 name: Release
 
+# Auto-release: pushing a version bump to main publishes to npm and creates
+# the GitHub release. A version is considered unreleased when no v<version>
+# tag exists yet.
 on:
-  release:
-    types: [published]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
-  publish:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      unreleased: ${{ steps.version.outputs.unreleased }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # need tags to detect already-released versions
+      - id: version
+        name: Detect version bump
+        run: |
+          version=$(node -p "require('./package.json').version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ -n "$(git tag -l "v$version")" ]; then
+            echo "unreleased=false" >> "$GITHUB_OUTPUT"
+            echo "v$version is already tagged — nothing to release."
+          else
+            echo "unreleased=true" >> "$GITHUB_OUTPUT"
+            echo "v$version is not tagged yet — releasing."
+          fi
+
+  release:
+    needs: check
+    if: needs.check.outputs.unreleased == 'true'
     runs-on: ubuntu-latest
     permissions:
       id-token: write # npm trusted publishing (OIDC) + provenance
-      contents: read
+      contents: write # push the version tag + create the GitHub release
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
+          cache: npm
       - name: Install
         run: npm ci
       - name: Typecheck
         run: npx tsc --noEmit
       - name: Test
         run: npx vitest run
-      - name: Check release tag matches package version
-        run: |
-          version=$(node -p "require('./package.json').version")
-          if [ "v${version}" != "${{ github.event.release.tag_name }}" ]; then
-            echo "Release tag ${{ github.event.release.tag_name }} does not match package version v${version}"
-            exit 1
-          fi
       - name: Build
         run: npm run build
+      - name: Authenticate with npm token (fallback when OIDC is not set up)
+        if: env.NPM_TOKEN != ''
+        run: echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" >> ~/.npmrc
       - name: Publish to npm
         run: npm publish --provenance --access public
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ needs.check.outputs.version }}" \
+            --title "v${{ needs.check.outputs.version }}" \
+            --generate-notes
