@@ -31,6 +31,7 @@ import {
 } from "@langchain/langgraph-checkpoint";
 
 import { TenancyError, UnscopedAccessError } from "./errors.js";
+import { emitEvent, type TenancyEventHandler } from "./events.js";
 import { validateTenant } from "./tenant.js";
 
 /**
@@ -44,12 +45,20 @@ const UNSCOPED_MESSAGE =
   "nodes, or store.forTenant(tenantId) outside runs. Raw store access is " +
   "refused so it cannot silently read or write across tenants.";
 
+export interface TenantScopedStoreOptions {
+  /** Called on every refused (unscoped) operation. */
+  onEvent?: TenancyEventHandler;
+}
+
 export class TenantScopedStore extends BaseStore {
   readonly inner: BaseStore;
 
-  constructor(inner: BaseStore) {
+  private readonly onEvent?: TenancyEventHandler;
+
+  constructor(inner: BaseStore, options?: TenantScopedStoreOptions) {
     super();
     this.inner = inner;
+    this.onEvent = options?.onEvent;
   }
 
   /** A view of the store pinned to one tenant, for use outside a run. */
@@ -64,33 +73,42 @@ export class TenantScopedStore extends BaseStore {
     return this.inner.batch(scoped);
   }
 
+  private deny(operation: string): never {
+    const error = new UnscopedAccessError(UNSCOPED_MESSAGE);
+    emitEvent(this.onEvent, { type: "denied", operation, error });
+    throw error;
+  }
+
   private requireScoped(op: Operation): Operation {
     if ("namespacePrefix" in op) {
-      this.assertSentinel(op.namespacePrefix);
+      this.assertSentinel(op.namespacePrefix, "search");
       return { ...op, namespacePrefix: op.namespacePrefix.slice(1) };
     }
     if ("namespace" in op) {
-      this.assertSentinel(op.namespace);
+      this.assertSentinel(op.namespace, "get/put/delete");
       return { ...op, namespace: op.namespace.slice(1) };
     }
     // ListNamespacesOperation: the prefix condition must carry the sentinel.
     const conditions = op.matchConditions ?? [];
     const prefixIndex = conditions.findIndex((c) => c.matchType === "prefix");
-    if (prefixIndex < 0) throw new UnscopedAccessError(UNSCOPED_MESSAGE);
-    this.assertSentinel(conditions[prefixIndex].path as string[]);
+    if (prefixIndex < 0) this.deny("listNamespaces");
+    this.assertSentinel(
+      conditions[prefixIndex].path as string[],
+      "listNamespaces"
+    );
     const next = conditions.map((c, i) =>
       i === prefixIndex ? { ...c, path: c.path.slice(1) } : c
     ) as MatchCondition[];
     return { ...op, matchConditions: next };
   }
 
-  private assertSentinel(namespace: string[]): void {
+  private assertSentinel(namespace: string[], operation: string): void {
     if (
       namespace[0] !== TENANT_NS_SENTINEL ||
       typeof namespace[1] !== "string" ||
       namespace[1].length === 0
     ) {
-      throw new UnscopedAccessError(UNSCOPED_MESSAGE);
+      this.deny(operation);
     }
   }
 
@@ -124,7 +142,8 @@ export interface TenantStoreTarget {
     namespace: string[],
     key: string,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    value: Record<string, any>
+    value: Record<string, any>,
+    index?: false | string[]
   ): Promise<void>;
   delete(namespace: string[], key: string): Promise<void>;
   listNamespaces?(options?: {
@@ -149,8 +168,8 @@ export class TenantStoreView {
 
   private unscopeItem<T extends Item | null>(item: T): T {
     // the inner store returns [tenant, ...rest]; the tenant never leaks out
-    if (item) item.namespace = item.namespace.slice(1);
-    return item;
+    if (!item) return item;
+    return { ...item, namespace: item.namespace.slice(1) };
   }
 
   async get(namespace: string[], key: string): Promise<Item | null> {
@@ -165,17 +184,25 @@ export class TenantStoreView {
       this.scopeNs(namespacePrefix),
       options
     );
-    for (const item of items) this.unscopeItem(item);
-    return items;
+    return items.map((item) => this.unscopeItem(item));
   }
 
   async put(
     namespace: string[],
     key: string,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    value: Record<string, any>
+    value: Record<string, any>,
+    index?: false | string[]
   ): Promise<void> {
-    return this.target.put(this.scopeNs(namespace), key, value);
+    // AsyncBatchedStore.put (what nodes get as config.store) takes no index
+    // argument and would drop it silently; refuse instead.
+    if (index !== undefined && this.target.put.length < 4) {
+      throw new TenancyError(
+        "put(..., index): config.store batches operations and drops the " +
+          "index argument. Call it on store.forTenant(tenantId) instead."
+      );
+    }
+    return this.target.put(this.scopeNs(namespace), key, value, index);
   }
 
   async delete(namespace: string[], key: string): Promise<void> {
@@ -206,6 +233,24 @@ export class TenantStoreView {
     return results
       .filter((ns) => ns[0] === this.tenant)
       .map((ns) => ns.slice(1));
+  }
+
+  /**
+   * GDPR-style erasure: delete every item stored for this tenant. Works in
+   * batches so it stays memory-bounded; returns the number of items deleted.
+   * Note: some stores (e.g. `InMemoryStore`) keep now-empty namespace labels
+   * visible in `listNamespaces()` — the items themselves are gone.
+   */
+  async purge(): Promise<number> {
+    let deleted = 0;
+    for (;;) {
+      const items = await this.search([], { limit: 100 });
+      if (items.length === 0) return deleted;
+      for (const item of items) {
+        await this.delete(item.namespace, item.key);
+      }
+      deleted += items.length;
+    }
   }
 }
 

@@ -16,6 +16,8 @@
  * const ledger = new InMemoryUsageLedger();
  * const checkpointer = new TenantScopedCheckpointer(new PostgresSaver(...), {
  *   usageLedger: ledger,
+ *   quota: { limits: (tenant) => plans[tenant] },
+ *   onEvent: (e) => logger.warn("tenancy", e),
  * });
  * const store = new TenantScopedStore(new InMemoryStore());
  *
@@ -33,24 +35,46 @@
 export {
   TenantCheckpointerHandle,
   TenantScopedCheckpointer,
+  type TenantScopedCheckpointerOptions,
 } from "./checkpointer.js";
 export {
   InvalidTenantError,
+  QuotaExceededError,
   TenancyError,
   TenantRequiredError,
   UnscopedAccessError,
+  type QuotaViolation,
 } from "./errors.js";
+export {
+  emitEvent,
+  type TenancyEvent,
+  type TenancyEventHandler,
+} from "./events.js";
+export {
+  findViolation,
+  type QuotaConfig,
+  type TenantLimits,
+  type UsageSnapshot,
+} from "./quota.js";
 export {
   TENANT_NS_SENTINEL,
   TenantScopedStore,
   TenantStoreView,
   getTenantStore,
+  type TenantScopedStoreOptions,
   type TenantStoreTarget,
 } from "./store.js";
-export { SEP, validateTenant } from "./tenant.js";
 export {
+  SEP,
+  TENANT_ID_PATTERN,
+  validateTenant,
+  validateThreadId,
+} from "./tenant.js";
+export {
+  BoundedStringSet,
   InMemoryUsageLedger,
   extractUsage,
+  extractUsageFromValues,
   type TenantUsage,
   type UsageLedger,
   type UsageRecord,

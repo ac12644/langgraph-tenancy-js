@@ -44,6 +44,20 @@ jobs:
       contents: write # push the version tag + create the GitHub release
     env:
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: tenancy_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -56,6 +70,8 @@ jobs:
         run: npx tsc --noEmit
       - name: Test
         run: npx vitest run
+        env:
+          POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/tenancy_test
       - name: Build
         run: npm run build
       - name: Authenticate with npm token (fallback when OIDC is not set up)

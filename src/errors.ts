@@ -33,8 +33,34 @@ export class UnscopedAccessError extends TenancyError {
 
 /**
  * A tenant id that could be used to escape its scope. Tenant ids become part
- * of storage keys, so they must not contain the separator or be empty.
+ * of storage keys AND store namespace segments, and physical backends flatten
+ * namespaces with their own separators, so only a conservative character set
+ * is accepted.
  */
 export class InvalidTenantError extends TenancyError {
   name = "InvalidTenantError";
+}
+
+/** Which quota a tenant ran over, and by how much. */
+export interface QuotaViolation {
+  tenantId: string;
+  field: "inputTokens" | "outputTokens" | "totalTokens" | "messages";
+  used: number;
+  limit: number;
+}
+
+/**
+ * A tenant is at or over one of its configured limits. Thrown from the
+ * checkpointer's `put()`, i.e. at the persistence boundary: the over-budget
+ * tenant's next run fails at its first checkpoint, before any model call.
+ */
+export class QuotaExceededError extends TenancyError {
+  name = "QuotaExceededError";
+
+  constructor(readonly violation: QuotaViolation) {
+    super(
+      `Tenant ${JSON.stringify(violation.tenantId)} is over quota: ` +
+        `${violation.field} ${violation.used} >= limit ${violation.limit}.`
+    );
+  }
 }

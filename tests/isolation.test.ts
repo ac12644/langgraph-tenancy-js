@@ -6,80 +6,22 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { AIMessage } from "@langchain/core/messages";
-import type { RunnableConfig } from "@langchain/core/runnables";
 import {
   InMemoryStore,
   MemorySaver,
-  type BaseCheckpointSaver,
-  type BaseStore,
 } from "@langchain/langgraph-checkpoint";
-import {
-  Annotation,
-  END,
-  START,
-  StateGraph,
-  type LangGraphRunnableConfig,
-} from "@langchain/langgraph";
 
 import {
   InMemoryUsageLedger,
   InvalidTenantError,
+  TenancyError,
   TenantRequiredError,
   TenantScopedCheckpointer,
   TenantScopedStore,
   UnscopedAccessError,
   getTenantStore,
 } from "../src/index.js";
-
-const State = Annotation.Root({
-  messages: Annotation<unknown[]>({
-    reducer: (a, b) => a.concat(b),
-    default: () => [],
-  }),
-});
-
-function makeGraph(options: {
-  checkpointer: BaseCheckpointSaver;
-  store?: BaseStore;
-  rawStoreAccess?: boolean;
-  modelName?: string;
-}) {
-  const { checkpointer, store, rawStoreAccess, modelName } = options;
-  const agent = async (
-    state: typeof State.State,
-    config: LangGraphRunnableConfig
-  ) => {
-    // real chat models always set an id; the ledger dedupes on it
-    const reply = new AIMessage({
-      id: crypto.randomUUID(),
-      content: `echo: ${state.messages.at(-1)}`,
-      usage_metadata: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
-      response_metadata: { model_name: modelName ?? "claude-sonnet-4-6" },
-    });
-    if (store) {
-      if (rawStoreAccess) {
-        // bypass tenancy on purpose — must fail closed
-        await config.store!.put(["memories"], "leak", { oops: true });
-      } else {
-        const tenantStore = getTenantStore(config);
-        await tenantStore.put(["memories"], `note-${state.messages.length}`, {
-          last: String(state.messages.at(-1)),
-        });
-      }
-    }
-    return { messages: [reply] };
-  };
-  return new StateGraph(State)
-    .addNode("agent", agent)
-    .addEdge(START, "agent")
-    .addEdge("agent", END)
-    .compile({ checkpointer, store });
-}
-
-const cfg = (tenant: string, thread = "t1"): RunnableConfig => ({
-  configurable: { thread_id: thread, tenant_id: tenant },
-});
+import { cfg, makeGraph } from "./helpers.js";
 
 describe("checkpointer isolation", () => {
   it("same thread_id for different tenants does not collide", async () => {
@@ -107,6 +49,13 @@ describe("checkpointer isolation", () => {
     ).rejects.toThrow(TenantRequiredError);
   });
 
+  it("missing thread_id raises instead of writing to 'tenant::undefined'", async () => {
+    const saver = new TenantScopedCheckpointer(new MemorySaver());
+    await expect(
+      saver.getTuple({ configurable: { tenant_id: "acme" } })
+    ).rejects.toThrow(TenancyError);
+  });
+
   it("tenant_id cannot contain the separator", async () => {
     const graph = makeGraph({
       checkpointer: new TenantScopedCheckpointer(new MemorySaver()),
@@ -114,6 +63,18 @@ describe("checkpointer isolation", () => {
     await expect(
       graph.invoke({ messages: ["hi"] }, cfg("acme::evil"))
     ).rejects.toThrow(InvalidTenantError);
+  });
+
+  it("tenant_id is restricted to a storage-safe charset", async () => {
+    const graph = makeGraph({
+      checkpointer: new TenantScopedCheckpointer(new MemorySaver()),
+    });
+    // '.' is a namespace separator in some physical backends
+    for (const evil of ["acme.evil", "acme/evil", "acme evil", "a".repeat(65)]) {
+      await expect(
+        graph.invoke({ messages: ["hi"] }, cfg(evil))
+      ).rejects.toThrow(InvalidTenantError);
+    }
   });
 
   it("list() without a tenant is refused", async () => {
@@ -148,6 +109,36 @@ describe("checkpointer isolation", () => {
     expect(seen.every((t) => t === "t1")).toBe(true);
   });
 
+  it("tenant-wide list() (no thread_id) spans the tenant's threads and only those", async () => {
+    const saver = new TenantScopedCheckpointer(new MemorySaver());
+    const graph = makeGraph({ checkpointer: saver });
+    await graph.invoke({ messages: ["a"] }, cfg("acme", "t1"));
+    await graph.invoke({ messages: ["b"] }, cfg("acme", "t2"));
+    await graph.invoke({ messages: ["c"] }, cfg("globex", "t3"));
+
+    const threads = new Set<string>();
+    for await (const tuple of saver.list({
+      configurable: { tenant_id: "acme" },
+    })) {
+      threads.add(tuple.config.configurable?.thread_id as string);
+      expect(tuple.config.configurable?.tenant_id).toBe("acme");
+      expect(JSON.stringify(tuple.checkpoint.channel_values)).not.toContain(
+        "globex"
+      );
+    }
+    expect([...threads].sort()).toEqual(["t1", "t2"]);
+
+    // limit applies AFTER tenant filtering
+    const limited: unknown[] = [];
+    for await (const tuple of saver.list(
+      { configurable: { tenant_id: "acme" } },
+      { limit: 2 }
+    )) {
+      limited.push(tuple);
+    }
+    expect(limited).toHaveLength(2);
+  });
+
   it("deleteThread requires a tenant handle and only touches that tenant", async () => {
     const saver = new TenantScopedCheckpointer(new MemorySaver());
     const graph = makeGraph({ checkpointer: saver });
@@ -159,6 +150,34 @@ describe("checkpointer isolation", () => {
     await saver.forTenant("acme").deleteThread("t1");
     expect(await saver.getTuple(cfg("acme"))).toBeUndefined();
     expect(await saver.getTuple(cfg("globex"))).toBeDefined();
+  });
+
+  it("getDeltaChannelHistory requires a tenant and stays scoped", async () => {
+    const inner = new MemorySaver();
+    const saver = new TenantScopedCheckpointer(inner);
+    const graph = makeGraph({ checkpointer: saver });
+    await graph.invoke({ messages: ["a"] }, cfg("acme"));
+    await graph.invoke({ messages: ["b"] }, cfg("globex"));
+
+    await expect(
+      saver.getDeltaChannelHistory({
+        config: { configurable: { thread_id: "t1" } },
+        channels: ["messages"],
+      })
+    ).rejects.toThrow(TenantRequiredError);
+
+    // delegates to the inner saver's (possibly optimized) implementation
+    // under the tenant-prefixed key
+    const viaWrapper = await saver.getDeltaChannelHistory({
+      config: cfg("acme"),
+      channels: ["messages"],
+    });
+    const viaInner = await inner.getDeltaChannelHistory({
+      config: { configurable: { thread_id: "acme::t1" } },
+      channels: ["messages"],
+    });
+    expect(viaWrapper).toEqual(viaInner);
+    expect(JSON.stringify(viaWrapper)).not.toContain("globex");
   });
 
   it("storage keys are physically tenant-prefixed", async () => {
