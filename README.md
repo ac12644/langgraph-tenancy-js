@@ -29,6 +29,8 @@ data, and observability hooks for every denial.
 npm install langgraph-tenancy
 ```
 
+Requires `@langchain/langgraph-checkpoint >= 1.1.3` (peer dependency).
+
 ## Usage
 
 Wrap your existing checkpointer and store. `tenant_id` becomes required.
@@ -134,6 +136,12 @@ A throwing ledger does **not** fail checkpoint writes: the error is reported
 through `onEvent` (type `"ledger_error"`) and the record is retried on the
 next checkpoint. Set `ledgerErrors: "throw"` if you'd rather fail the write.
 
+Metering extracts from both checkpoints and pending writes, so it keeps
+working with `DeltaChannel` (beta) graphs, whose checkpoints carry only a
+sentinel instead of the accumulated messages. The delta-channel history walk
+(`getDeltaChannelHistory`) is likewise delegated to your inner saver under a
+tenant-scoped config.
+
 ## Observability
 
 Every denial is a security-relevant event. Wire them to your logger, metrics,
@@ -221,7 +229,8 @@ raw LangGraph.js API allows — runs in CI against the real `MemorySaver` /
 `InMemoryStore` **and real SQL backends**: `SqliteSaver` in-process and
 `PostgresSaver` against a Postgres 17 service container. Coverage includes
 raw `config.store` access failing closed, tenant-wide listing, quota
-enforcement, GDPR purge, and `adoptThread` migration on every backend.
+enforcement, GDPR purge, delta-channel metering, and `adoptThread`
+migration on every backend.
 
 ## License
 
